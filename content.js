@@ -227,6 +227,15 @@
   // key), so init re-promotes the mirror to sync once.
   let _loadedFromLocal = false;
 
+  // _bookmarkStateKnown records whether THIS DEVICE has an authoritative answer
+  // for this site, meaning a key exists in sync or in the local mirror. A key
+  // exists as soon as the device has ever saved anything here, including an
+  // empty object written by a deliberate clear (a tombstone). It is false only
+  // when the device has genuinely never seen this site's bookmark data, which
+  // is exactly the "second device visiting for the first time" case where
+  // waiting for a cross-device sync makes sense.
+  let _bookmarkStateKnown = false;
+
   function loadBookmarks() {
     return new Promise(res => {
       if (!isExtensionAlive()) { res({}); return; }
@@ -235,6 +244,7 @@
           if (!chrome.runtime.lastError && d && (STORAGE_KEY in d)) {
             // Key present in sync: authoritative, even if empty (tombstone).
             _loadedFromLocal = false;
+            _bookmarkStateKnown = true;
             res(d[STORAGE_KEY] || {});
             return;
           }
@@ -243,6 +253,9 @@
           try {
             chrome.storage.local.get(STORAGE_KEY, l => {
               if (chrome.runtime.lastError) { res({}); return; }
+              // A mirror key existing at all is also authoritative knowledge:
+              // this device has saved here before, so zero really means zero.
+              _bookmarkStateKnown = (STORAGE_KEY in l);
               const mirror = l[STORAGE_KEY] || {};
               _loadedFromLocal = Object.keys(mirror).length > 0;
               res(mirror);
@@ -736,18 +749,26 @@
       return;
     }
 
-    // Zero bookmarks locally. This is either genuinely empty, or a device that
-    // hasn't received a cross-device sync yet. Only show the syncing state when:
-    //   - sync is actually available (otherwise a "syncing" label would lie),
-    //   - we are still in the first-access window for this session, and
-    //   - this is the first time the window is used this session.
-    // Casual page-to-page browsing therefore never shows it; only the first
-    // page opened on the device in a session can, and only when there is truly
-    // nothing stored yet.
+    // Zero bookmarks. Distinguish two very different situations:
+    //
+    //   a) This device KNOWS the answer is zero, because a key exists in sync or
+    //      in the local mirror. That happens once the device has saved anything
+    //      here, including the empty object written by removing the last
+    //      bookmark or clearing the site. Zero is correct and final: show
+    //      nothing. This is the device that placed (and then removed) the
+    //      bookmarks, so it must never wait on a sync that is not coming.
+    //
+    //   b) This device has NEVER seen this site's bookmark data (no key in
+    //      either area). That is a second device visiting for the first time,
+    //      where bookmarks placed elsewhere may still be propagating. Only here
+    //      is a brief wait meaningful.
+    //
+    // The session flag additionally keeps case (b) to a single appearance per
+    // session, so even a genuinely new device does not repeat it while browsing.
     let syncUsable = false;
     try { syncUsable = !!(chrome?.storage?.sync); } catch (_) { syncUsable = false; }
 
-    if (_withinSyncWindow && syncUsable) {
+    if (!_bookmarkStateKnown && _withinSyncWindow && syncUsable) {
       // Consume the one-shot session flag immediately so any later navigation in
       // this session skips the syncing state entirely.
       try { sessionStorage.setItem(SYNC_SEEN_KEY, "1"); } catch (_) {}
@@ -1154,7 +1175,12 @@
   //   2. On a 429 / 503 / 403, backs off and retries with exponential delay,
   //      honoring a Retry-After header when present.
   // This keeps a wide sweep slower-but-reliable rather than fast-but-blocked.
-  const MIN_FETCH_SPACING_MS = 350;   // minimum gap between requests to a host
+  // Spacing starts low so boorus that do not rate-limit stay fast, and rises
+  // permanently for the page once a host actually pushes back. That way the
+  // slow, cautious pace is paid only where it is needed.
+  const FETCH_SPACING_NORMAL_MS = 120;
+  const FETCH_SPACING_LIMITED_MS = 700;
+  let _fetchSpacingMs = FETCH_SPACING_NORMAL_MS;
   const MAX_FETCH_RETRIES    = 4;
   let _fetchChain = Promise.resolve(); // serializes fetches
   let _lastFetchAt = 0;
@@ -1164,9 +1190,9 @@
   // Schedule a paced fetch. Returns the Response, or null on give-up/error.
   function politeFetch(url) {
     const run = async () => {
-      // Space requests: wait until MIN_FETCH_SPACING_MS has elapsed since the
+      // Space requests: wait until the current spacing has elapsed since the
       // previous one started.
-      const wait = _lastFetchAt + MIN_FETCH_SPACING_MS - Date.now();
+      const wait = _lastFetchAt + _fetchSpacingMs - Date.now();
       if (wait > 0) await sleep(wait);
 
       for (let attempt = 0; attempt <= MAX_FETCH_RETRIES; attempt++) {
@@ -1182,6 +1208,9 @@
 
         // Rate-limited or temporarily blocked: back off and retry.
         if (resp.status === 429 || resp.status === 503 || resp.status === 403) {
+          // This host rate-limits. Slow every subsequent request for the rest of
+          // the page's life, not just this retry, so the sweep stops tripping it.
+          _fetchSpacingMs = FETCH_SPACING_LIMITED_MS;
           if (attempt >= MAX_FETCH_RETRIES) return resp;
           let delay = 800 * Math.pow(2, attempt); // 0.8s, 1.6s, 3.2s, 6.4s
           const ra = resp.headers.get("retry-after");
@@ -1211,20 +1240,146 @@
   // boorus order the default index by post ID DESCENDING, so a target ID higher
   // than a page's max means the post is on an EARLIER page, lower than its min
   // means a LATER page, and within range means it's on this page.
-  // Returns { ids:[...], maxNum, minNum, count } - empty page => count 0.
-  async function fetchPageInfo(pageUrl) {
-    try {
-      const resp = await politeFetch(pageUrl);
-      if (!resp || !resp.ok) return { ids: [], maxNum: null, minNum: null, count: 0 };
-      const html = await resp.text();
-      const doc  = new DOMParser().parseFromString(html, "text/html");
-      return extractPageInfo(doc);
-    } catch (_) {
-      return { ids: [], maxNum: null, minNum: null, count: 0 };
-    }
+  // Returns { ids:[...], maxNum, minNum, count, ok } - empty page => count 0.
+  // ok is false when the request itself failed (network error, rate-limit
+  // give-up, non-OK status). This MUST be distinguished from a genuinely empty
+  // page: an empty page means we have run past the end of the listing and a
+  // sweep should stop, whereas a failed fetch means we simply learned nothing
+  // and stopping would report a present bookmark as missing.
+  // Some sites answer rate limiting with HTTP 200 and a plain HTML notice
+  // rather than a 429 status. Such a page parses fine and simply contains no
+  // posts, so without this it is indistinguishable from running past the last
+  // page of a listing, which would abort a search and report a present
+  // bookmark as deleted. Only applied to pages that yielded no posts, so a
+  // normal listing can never be misread as a block.
+  function looksRateLimited(html) {
+    return /too many requests|rate[ -]?limit|slow down|throttl|temporarily blocked|try again (in|later)|flood protection/i
+      .test(html);
   }
 
-  // Concurrent linear sweep over a page range [fromPage, toPage] inclusive,
+  async function fetchPageInfo(pageUrl) {
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      try {
+        const resp = await politeFetch(pageUrl);
+        if (!resp || !resp.ok) return { ids: [], maxNum: null, minNum: null, count: 0, ok: false };
+        const html = await resp.text();
+        const doc  = new DOMParser().parseFromString(html, "text/html");
+        const info = extractPageInfo(doc);
+
+        if (info.count === 0 && looksRateLimited(html)) {
+          // Soft block. Slow down for the rest of this page's life and retry,
+          // rather than mistaking it for the end of the listing.
+          _fetchSpacingMs = FETCH_SPACING_LIMITED_MS;
+          if (attempt < 2) {
+            try { showToast("Site is rate-limiting, slowing down...", "info"); } catch (_) {}
+            await sleep(1500 * (attempt + 1));
+            continue;
+          }
+          return { ids: [], maxNum: null, minNum: null, count: 0, ok: false };
+        }
+
+        info.ok = true;
+        return info;
+      } catch (_) {
+        return { ids: [], maxNum: null, minNum: null, count: 0, ok: false };
+      }
+    }
+    return { ids: [], maxNum: null, minNum: null, count: 0, ok: false };
+  }
+
+  // ── Direct post status lookup ─────────────────────────────────────────────
+  // Asking the site whether a post still exists is vastly cheaper than
+  // inferring it from an exhaustive index sweep. Two facts make this work:
+  //
+  //   1. Every engine has post permalinks, so we can learn the URL shape from
+  //      any post link already on the page and substitute our target's ID. No
+  //      per-engine table is needed, so this also works on self-hosted
+  //      instances with unusual paths.
+  //   2. Danbooru-family engines soft-delete: the post keeps its permalink and
+  //      JSON record but leaves the default index listings. That is exactly the
+  //      case that used to cause an endless sweep, since the post genuinely is
+  //      on no index page. Their JSON reports it explicitly via is_deleted.
+  //
+  // This is strictly an optimization: only a DEFINITIVE answer short-circuits
+  // the search. Anything ambiguous falls through to the existing behavior, so a
+  // site that responds unusually can never cause a false "deleted" verdict.
+
+  // Build the permalink for a numeric post ID by copying the shape of a post
+  // link on the current page. Returns null if no sample link is available.
+  function buildPostPermalink(num) {
+    for (const a of document.querySelectorAll("a[href]")) {
+      const key = postIdFromAnchorHref(a);
+      if (!key) continue;
+      const sampleId = key.slice(4);
+      if (sampleId === String(num)) return new URL(a.getAttribute("href"), location.origin).href;
+      const href = a.getAttribute("href");
+      // Replace the id where it appears as a whole number, preserving the rest.
+      const rebuilt = href.replace(
+        new RegExp("(^|[/=])" + sampleId + "(?![0-9])"), "$1" + num
+      );
+      if (rebuilt !== href) {
+        try { return new URL(rebuilt, location.origin).href; } catch (_) { return null; }
+      }
+    }
+    return null;
+  }
+
+  // Resolve a post's status. Returns one of:
+  //   "gone"    - the post does not exist (permalink 404). Stop searching.
+  //   "unlisted"- the post exists but is flagged deleted, so it is on no index
+  //               page. Stop searching.
+  //   "unknown" - no definitive answer. Caller must fall back to searching.
+  async function checkPostStatus(postId) {
+    const m = /^num:(\d+)$/.exec(postId || "");
+    if (!m) return "unknown";
+    const num = m[1];
+
+    const permalink = buildPostPermalink(num);
+    if (!permalink) return "unknown";
+
+    // Danbooru-family exposes structured JSON at <permalink>.json, which states
+    // soft deletion outright. Only attempt it when the permalink has that
+    // shape, so other engines are not sent a request that cannot succeed.
+    if (/\/posts\/\d+(?:$|[?#])/i.test(permalink)) {
+      try {
+        const jsonUrl = permalink.replace(/(\/posts\/\d+)(?=$|[?#])/i, "$1.json");
+        const r = await politeFetch(jsonUrl);
+        if (r && r.status === 404) return "gone";
+        if (r && r.ok) {
+          const data = await r.json();
+          if (data && typeof data === "object") {
+            if (data.is_deleted === true) return "unlisted";
+            if (data.id) return "unknown"; // exists and listable: keep searching
+          }
+        }
+      } catch (_) { /* fall through to the plain permalink check */ }
+    }
+
+    // Universal fallback: a 404 on the post's own page means it is genuinely
+    // gone on every engine. A 200 tells us it exists but not whether it is
+    // listable, which is not definitive, so we report unknown and search on.
+    try {
+      const r = await politeFetch(permalink);
+      if (r && r.status === 404) {
+        // Before trusting that, confirm the URL shape itself is right. If a
+        // post we can currently SEE also 404s at the same shape, then we built
+        // a bad URL rather than finding a deleted post, and reporting "deleted"
+        // would be a false negative. Falling back to searching is the safe
+        // outcome, and this costs one request only on the deletion path.
+        const controlKey = livePageInfo().ids.find(k => /^num:/.test(k) && k.slice(4) !== num);
+        if (controlKey) {
+          const controlUrl = buildPostPermalink(controlKey.slice(4));
+          if (controlUrl) {
+            const cr = await politeFetch(controlUrl);
+            if (!cr || cr.status === 404) return "unknown"; // shape is wrong
+          }
+        }
+        return "gone";
+      }
+    } catch (_) { /* ignore */ }
+    return "unknown";
+  }
+
   // navigating to the first page found to contain the post. Returns true if it
   // navigated, false if the post wasn't found in the swept range. Used as a
   // safety net after binary search (whose ID-monotonic assumption can be
@@ -1233,15 +1388,52 @@
     const lo = Math.max(1, Math.min(fromPage, toPage));
     const hi = Math.max(fromPage, toPage);
     // Requests are paced and serialized by politeFetch, so we scan sequentially
-    // and stop at the first hit. This avoids firing a burst of connections at
-    // hosts with strict rate limiters, at the cost of being a little slower on
-    // a wide sweep (which only happens as a fallback, not on the common path).
+    // and stop at the first hit.
+    //
+    // END-OF-LISTING DETECTION is essential here. Without it a sweep bounded at
+    // page 300 keeps fetching long after the listing has ended, which on a
+    // paced connection is minutes of pointless requests and looks like an
+    // endless scan. We stop when either:
+    //   - a successfully fetched page contains no posts (past the end), or
+    //   - a page repeats the previous page's contents, which is how some sites
+    //     respond to an out-of-range page number instead of returning nothing.
+    // A FAILED fetch is never treated as the end, since that would abandon the
+    // search and report a present bookmark as missing.
+    let prevSignature = null;
+    let consecutiveFailures = 0;
+    let consecutiveEmpty = 0;
+
     for (let p = lo; p <= hi; p++) {
       // Progress feedback every few pages so a paced search isn't silent.
       if (p > lo && (p - lo) % 4 === 0) {
         showToast("Still searching... page " + p, "info");
       }
       const info = await fetchPageInfo(buildIndexPageUrl(bookmarkPageUrl, p));
+
+      if (!info.ok) {
+        // Request failed rather than the listing ending. Tolerate a few, then
+        // give up rather than hammering a host that is refusing us.
+        if (++consecutiveFailures >= 3) return false;
+        continue;
+      }
+      consecutiveFailures = 0;
+
+      if (info.count === 0) {
+        // An empty page usually means we are past the last page, but a single
+        // anomalous page (a soft block, a transient render, a bad URL guess)
+        // must NOT abandon the search and report a present bookmark as gone.
+        // Require two in a row before believing the listing has ended.
+        if (++consecutiveEmpty >= 2) return false;
+        continue;
+      }
+      consecutiveEmpty = 0;
+
+      const signature = info.count + ":" + info.maxNum + ":" + info.minNum;
+      if (prevSignature !== null && signature === prevSignature) {
+        return false;                              // site clamped: past the end
+      }
+      prevSignature = signature;
+
       if (info.ids.includes(postId)) {
         sessionStorage.setItem("booru_bm_autojump", "1");
         sessionStorage.setItem("booru_bm_walked", "1");
@@ -1326,11 +1518,18 @@
       navigateTo(dest);
     };
 
-    const notFound = () => {
+    const notFound = (reason) => {
+      // When the site gave a definitive answer we can say so plainly instead of
+      // guessing. "unlisted" means the post still exists at its own URL but has
+      // been removed from index listings, which is worth distinguishing.
+      const message =
+        reason === "gone"     ? "Bookmarked post no longer exists" :
+        reason === "unlisted" ? "Bookmarked post was deleted and is no longer listed" :
+                                "Bookmark Not found! Deleted?";
       sessionStorage.setItem("booru_bm_deleted_notice", "1");
       if (sameIndexPage(bookmarkPageUrl)) {
         sessionStorage.removeItem("booru_bm_deleted_notice");
-        showErrorToast("Bookmark Not found! Deleted?");
+        showErrorToast(message);
       } else {
         navigateTo(buildIndexPageUrl(bookmarkPageUrl, startPage));
       }
@@ -1422,7 +1621,12 @@
         // its ID range also tightens the bracket for the binary phase.
         if (probe > lo && (hi === null || probe < hi)) {
           const info = await fetchPageInfo(buildIndexPageUrl(bookmarkPageUrl, probe));
-          if (info.count === 0) {
+          // A failed fetch tells us nothing; only a successfully fetched empty
+          // page means we are past the end of the listing. Treating a failure
+          // as the end would mis-bracket the search and miss a present post.
+          if (!info.ok) {
+            // Learn nothing from this probe; fall through to the expand phase.
+          } else if (info.count === 0) {
             hi = Math.min(hi ?? probe, probe);
             bounded = true;
           } else {
@@ -1446,6 +1650,7 @@
         for (let i = 0; i < 24 && !bounded; i++) {
           const info = await fetchPageInfo(buildIndexPageUrl(bookmarkPageUrl, probe));
 
+          if (!info.ok) break;  // request failed: stop probing, use the sweep
           if (info.count === 0) {
             // Past the end -> this is an upper bound on the page number.
             hi = probe;
@@ -1481,6 +1686,7 @@
           while (lo + 1 < hi) {
             const mid  = Math.floor((lo + hi) / 2);
             const info = await fetchPageInfo(buildIndexPageUrl(bookmarkPageUrl, mid));
+            if (!info.ok) break;                       // failed fetch: bail to sweep
             if (info.count === 0) { hi = mid; continue; }
             if (info.ids.includes(postId)) { goToPage(mid); return; }
             if (info.minNum === null) break;
@@ -1509,6 +1715,13 @@
         }
       }
 
+      // Before paying for an exhaustive sweep, ask the site directly whether
+      // the post still exists and is still listable. A definitive answer here
+      // replaces dozens of index fetches with one small request. Anything
+      // inconclusive falls through to the sweep exactly as before.
+      const status = await checkPostStatus(postId);
+      if (status === "gone" || status === "unlisted") { notFound(status); return; }
+
       // Nothing conclusive from interpolation or binary search. Verify with a
       // bounded exhaustive sweep before declaring deletion, so a post that
       // exists is never falsely reported gone regardless of markup or ordering.
@@ -1524,7 +1737,9 @@
 
     // Build an outward-spiraling page order from the best guess, then scan it
     // one page at a time. Requests are paced by politeFetch, so this never
-    // bursts connections at a rate-limited host.
+    // bursts connections at a rate-limited host. Once a page beyond the end of
+    // the listing is seen, every higher page number is pruned, so the scan does
+    // not keep requesting pages that cannot exist.
     const order = [firstProbe];
     for (let d = 1; d < LINEAR_MAX; d++) {
       if (firstProbe + d <= LINEAR_MAX) order.push(firstProbe + d);
@@ -1532,13 +1747,29 @@
     }
 
     let scanned = 0;
+    let knownEndPage = Infinity;   // first page number known to be past the end
+    let consecutiveFailures = 0;
+
     for (const pageNum of order) {
+      if (pageNum >= knownEndPage) continue;      // pruned: beyond the listing
       scanned++;
       if (scanned > 1 && scanned % 4 === 0) {
         showToast("Still searching...", "info");
       }
-      const found = await pageContainsPost(buildIndexPageUrl(bookmarkPageUrl, pageNum), postId);
-      if (found) { goToPage(pageNum); return; }
+      const info = await fetchPageInfo(buildIndexPageUrl(bookmarkPageUrl, pageNum));
+
+      if (!info.ok) {
+        if (++consecutiveFailures >= 3) break;    // host refusing: stop trying
+        continue;
+      }
+      consecutiveFailures = 0;
+
+      if (info.count === 0) {
+        // Past the end of the listing. Remember it so higher pages are skipped.
+        knownEndPage = Math.min(knownEndPage, pageNum);
+        continue;
+      }
+      if (info.ids.includes(postId)) { goToPage(pageNum); return; }
     }
 
     notFound();
