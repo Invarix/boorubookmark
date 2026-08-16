@@ -4,17 +4,39 @@ const STORAGE_PFX = "booru_bm_";
 
 // Read a single site's bookmarks, sync first (cross-device), then falling back
 // to the legacy local area so pre-sync bookmarks still show a correct count.
+const isTombstone = (e) => !!(e && typeof e === "object" && e.deleted);
+const entryTime   = (e) => (!e || typeof e !== "object") ? 0
+                         : (e.deleted ? (e.at || 0) : (e.addedAt || 0));
+
+// Merge the two areas the same way the content script does, so the popup shows
+// the same set the page does. Removed entries are tombstones, not absences, so
+// they are filtered out of the count.
+function mergeSets(a, b) {
+  const out = {};
+  for (const k of new Set([...Object.keys(a || {}), ...Object.keys(b || {})])) {
+    const ea = a && a[k], eb = b && b[k];
+    if (ea === undefined) out[k] = eb;
+    else if (eb === undefined) out[k] = ea;
+    else out[k] = entryTime(eb) > entryTime(ea) ? eb : ea;
+  }
+  return out;
+}
+
+async function readSiteRaw(storageKey) {
+  let sync = null, local = null;
+  try { const s = await chrome.storage.sync.get(storageKey);  if (s && (storageKey in s)) sync = s[storageKey] || {}; } catch (_) {}
+  try { const l = await chrome.storage.local.get(storageKey); if (l && (storageKey in l)) local = l[storageKey] || {}; } catch (_) {}
+  if (sync === null) return local || {};
+  const legacyCleared = Object.keys(sync).length === 0 &&
+    local && Object.values(local).every(v => entryTime(v) === 0);
+  return legacyCleared ? {} : mergeSets(sync, local);
+}
+
 async function readSite(storageKey) {
-  try {
-    const s = await chrome.storage.sync.get(storageKey);
-    // A key PRESENT in sync is authoritative even when empty (tombstone from a
-    // deliberate clear). Only fall back to the mirror when the key is absent.
-    if (s && (storageKey in s)) return s[storageKey] || {};
-  } catch (_) { /* fall through to mirror */ }
-  try {
-    const l = await chrome.storage.local.get(storageKey);
-    return l[storageKey] || {};
-  } catch (_) { return {}; }
+  const raw = await readSiteRaw(storageKey);
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) if (!isTombstone(v)) out[k] = v;
+  return out;
 }
 
 // Clear sites by writing an EMPTY OBJECT (a tombstone) to sync and emptying the
@@ -25,10 +47,19 @@ async function readSite(storageKey) {
 async function clearEverywhere(keys) {
   const arr = Array.isArray(keys) ? keys : [keys];
   if (!arr.length) return;
-  const tombstones = {};
-  arr.forEach(k => { tombstones[k] = {}; });
-  try { await chrome.storage.sync.set(tombstones); }  catch (_) {}
-  try { await chrome.storage.local.set(tombstones); } catch (_) {}
+  const now = Date.now();
+  const payload = {};
+  for (const k of arr) {
+    // Tombstone every entry individually rather than writing an empty object.
+    // A merge on another device would otherwise treat this device's blank set
+    // as "knows nothing" and hand the cleared bookmarks straight back.
+    const raw = await readSiteRaw(k);
+    const cleared = {};
+    for (const id of Object.keys(raw)) cleared[id] = { deleted: true, at: now };
+    payload[k] = cleared;
+  }
+  try { await chrome.storage.sync.set(payload); }  catch (_) {}
+  try { await chrome.storage.local.set(payload); } catch (_) {}
 }
 
 // Collect every booru_bm_ key present in either area.

@@ -87,6 +87,10 @@
   let _pendingJumpId = null;
   let _pendingTimer  = null; // timeout to navigate if pending jump never resolves
   let _jumpInFlight  = false; // true while a cross-page search is running
+  // True when a search ended because the site refused our requests rather than
+  // because the post is absent. A blocked search must never be reported as a
+  // deletion: the honest answer is that we could not finish checking.
+  let _searchBlocked = false;
   // True for a short window after page load, during which a zero local bookmark
   // count might still be resolved by an incoming cross-device sync. Drives the
   // nav button's "Bookmark Sync in Progress" state. Opened at load, closed once
@@ -236,55 +240,141 @@
   // waiting for a cross-device sync makes sense.
   let _bookmarkStateKnown = false;
 
+  // ── Cross-device merge ────────────────────────────────────────────────────
+  // Every bookmark for a site lives under ONE sync key, so a blind write is
+  // last-write-wins: a device that saves before another device's entry has
+  // propagated would erase it. Saves therefore re-read both areas and MERGE.
+  //
+  // Merging needs deletions to be representable, or a stale device would keep
+  // resurrecting bookmarks the user removed. Each entry is therefore stamped,
+  // and a removal leaves a tombstone rather than vanishing:
+  //     live      { page, post, addedAt }
+  //     removed   { deleted: true, at }
+  // On conflict the newer stamp wins, so an add and a removal race resolves to
+  // whichever the user did last. Tombstones are pruned once they are older than
+  // any plausible sync delay.
+  const TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+  // Live keys returned by the most recent load. A save can then tell "the user
+  // removed this" (it was loaded and is now absent) from "this device has never
+  // seen it" (added elsewhere since the load), and only tombstone the former.
+  let _lastLoadedKeys = new Set();
+
+  const isTombstone = (e) => !!(e && typeof e === "object" && e.deleted);
+  const entryTime   = (e) => (!e || typeof e !== "object") ? 0
+                           : (e.deleted ? (e.at || 0) : (e.addedAt || 0));
+
+  function mergeBookmarkSets(a, b) {
+    const out = {};
+    const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+    for (const k of keys) {
+      const ea = a && a[k], eb = b && b[k];
+      if (ea === undefined)      out[k] = eb;
+      else if (eb === undefined) out[k] = ea;
+      else                       out[k] = entryTime(eb) > entryTime(ea) ? eb : ea;
+    }
+    return out;
+  }
+
+  function liveOnly(raw) {
+    const out = {};
+    for (const [k, v] of Object.entries(raw || {})) if (!isTombstone(v)) out[k] = v;
+    return out;
+  }
+
+  function pruneTombstones(raw, now) {
+    const out = {};
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (isTombstone(v) && (now - (v.at || 0)) > TOMBSTONE_TTL_MS) continue;
+      out[k] = v;
+    }
+    return out;
+  }
+
+  const areaGet = (area, key) => new Promise(res => {
+    try {
+      chrome.storage[area].get(key, d => {
+        if (chrome.runtime.lastError) { res(null); return; }
+        res(d && (key in d) ? (d[key] || {}) : null);
+      });
+    } catch (_) { res(null); }
+  });
+
   function loadBookmarks() {
-    return new Promise(res => {
+    return new Promise(async res => {
       if (!isExtensionAlive()) { res({}); return; }
-      try {
-        chrome.storage.sync.get(STORAGE_KEY, d => {
-          if (!chrome.runtime.lastError && d && (STORAGE_KEY in d)) {
-            // Key present in sync: authoritative, even if empty (tombstone).
-            _loadedFromLocal = false;
-            _bookmarkStateKnown = true;
-            res(d[STORAGE_KEY] || {});
-            return;
-          }
-          // Key absent from sync (fresh device, purge, or sync unavailable):
-          // fall back to the on-device mirror and flag for re-promotion.
-          try {
-            chrome.storage.local.get(STORAGE_KEY, l => {
-              if (chrome.runtime.lastError) { res({}); return; }
-              // A mirror key existing at all is also authoritative knowledge:
-              // this device has saved here before, so zero really means zero.
-              _bookmarkStateKnown = (STORAGE_KEY in l);
-              const mirror = l[STORAGE_KEY] || {};
-              _loadedFromLocal = Object.keys(mirror).length > 0;
-              res(mirror);
-            });
-          } catch (_) { res({}); }
-        });
-      } catch (_) {
-        res({});
+      const syncRaw  = await areaGet("sync", STORAGE_KEY);
+      const localRaw = await areaGet("local", STORAGE_KEY);
+
+      let raw;
+      if (syncRaw === null) {
+        // No key in sync at all: fresh device, purge, or sync unavailable. The
+        // on-device mirror is the only source, and is worth promoting upward.
+        raw = localRaw || {};
+        _loadedFromLocal = Object.keys(liveOnly(raw)).length > 0;
+        _bookmarkStateKnown = (localRaw !== null);
+      } else {
+        _loadedFromLocal = false;
+        _bookmarkStateKnown = true;
+        // Legacy compatibility: before per-entry tombstones a deliberate clear
+        // was written as an empty object. If sync holds that and the mirror's
+        // entries predate stamping, the clear is authoritative and must not be
+        // undone by merging the mirror back in.
+        const legacyCleared =
+          Object.keys(syncRaw).length === 0 &&
+          localRaw && Object.values(localRaw).every(v => entryTime(v) === 0);
+        raw = legacyCleared ? {} : mergeBookmarkSets(syncRaw, localRaw);
       }
+
+      const live = liveOnly(raw);
+      _lastLoadedKeys = new Set(Object.keys(live));
+      res(live);
     });
   }
 
   function saveBookmarks(obj) {
-    return new Promise(res => {
+    return new Promise(async res => {
       if (!isExtensionAlive()) { res(); return; }
-      try {
-        chrome.storage.sync.set({ [STORAGE_KEY]: obj }, () => {
-          // Regardless of the sync write's outcome (it can fail on quota),
-          // ALWAYS write the local mirror so the data survives on this device.
-          void chrome.runtime.lastError; // consume; sync failure is non-fatal
-          try {
-            chrome.storage.local.set({ [STORAGE_KEY]: obj }, () => res());
-          } catch (_) { res(); }
-        });
-      } catch (_) {
-        // sync API itself unavailable: still persist locally.
-        try { chrome.storage.local.set({ [STORAGE_KEY]: obj }, () => res()); }
-        catch (_) { res(); }
+      const now = Date.now();
+
+      // Re-read both areas at write time so entries another device added since
+      // this page loaded are carried forward instead of being overwritten.
+      const syncRaw  = await areaGet("sync", STORAGE_KEY);
+      const localRaw = await areaGet("local", STORAGE_KEY);
+      const current  = mergeBookmarkSets(syncRaw || {}, localRaw || {});
+
+      // Stamp the caller's set, preserving the original time where known.
+      const incoming = {};
+      for (const [k, v] of Object.entries(obj || {})) {
+        const prev = current[k];
+        // If the caller loaded this entry as live but it has since been removed
+        // elsewhere, the caller's copy is stale. Respect the removal rather
+        // than re-stamping it and resurrecting a bookmark the user deleted.
+        // A key the caller did NOT load is a deliberate (re-)add and proceeds.
+        if (isTombstone(prev) && _lastLoadedKeys.has(k)) continue;
+        const keep = (prev && !isTombstone(prev) && prev.addedAt) ? prev.addedAt : now;
+        incoming[k] = (v && typeof v === "object") ? { ...v, addedAt: keep } : v;
       }
+
+      let next = mergeBookmarkSets(current, incoming);
+
+      // Anything the caller loaded and then dropped is a deliberate removal.
+      for (const k of _lastLoadedKeys) {
+        if (!(k in (obj || {}))) next[k] = { deleted: true, at: now };
+      }
+      // Anything the caller supplied is live, even if a tombstone existed.
+      for (const k of Object.keys(incoming)) next[k] = incoming[k];
+
+      next = pruneTombstones(next, now);
+      _lastLoadedKeys = new Set(Object.keys(liveOnly(next)));
+
+      const writeLocal = () => {
+        try { chrome.storage.local.set({ [STORAGE_KEY]: next }, () => { void chrome.runtime.lastError; res(); }); }
+        catch (_) { res(); }
+      };
+      try {
+        chrome.storage.sync.set({ [STORAGE_KEY]: next }, () => { void chrome.runtime.lastError; writeLocal(); });
+      } catch (_) { writeLocal(); }
     });
   }
 
@@ -838,7 +928,9 @@
       sessionStorage.removeItem("booru_bm_jumpindex");
     }
     loadBookmarks().then(stored => {
-      const entries = Object.entries(stored);
+      // Same ordering as the jump cycle, so the index saved before navigating
+      // still refers to the same bookmark after the page loads.
+      const entries = orderedEntries(stored);
       if (!entries.length) return;
       const idx = Math.max(0, Math.min(_jumpIndex, entries.length - 1));
       const [postId, value] = entries[idx];
@@ -966,6 +1058,30 @@
 
   // ── Jump to bookmark ───────────────────────────────────────────────────────
 
+  // Cycle order for Navigate Bookmarks.
+  //
+  // Object key order is INSERTION order, which is wrong here in two ways. It
+  // puts the oldest bookmark first, so the first click after arriving lands on
+  // the least recently saved one rather than the one just made. And it differs
+  // between devices, because each device built its own object in its own order,
+  // so "bookmark 2 of 3" pointed at different posts depending where you clicked.
+  //
+  // Ordering by the stored timestamp, newest first, fixes both: the most recent
+  // bookmark is reached first, and every device agrees on the sequence. Entries
+  // saved before stamping existed have no timestamp and sort last, tie-broken by
+  // post ID so the order is still identical everywhere.
+  function orderedEntries(stored) {
+    const stamp = (v) => (v && typeof v === "object" && v.addedAt) ? v.addedAt : 0;
+    const idNum = (k) => { const m = /^num:(\d+)$/.exec(k); return m ? parseInt(m[1], 10) : 0; };
+    return Object.entries(stored || {}).sort((a, b) => {
+      const d = stamp(b[1]) - stamp(a[1]);
+      if (d !== 0) return d;
+      const n = idNum(b[0]) - idNum(a[0]);
+      if (n !== 0) return n;
+      return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+    });
+  }
+
   async function jumpToBookmark() {
     // Guard against a second click while a search/navigation is already in
     // flight. On deferred-loading boorus the search takes a moment, and a second
@@ -976,7 +1092,7 @@
     }
 
     const stored  = await loadBookmarks();
-    const entries = Object.entries(stored);
+    const entries = orderedEntries(stored);
     if (!entries.length) {
       showToast("No bookmarks saved for this site", "info");
       return;
@@ -1126,13 +1242,71 @@
   // Wrapper-derived IDs are still collected, but for MEMBERSHIP only, and only
   // from wrappers that contain an image (thumbnails always do; layout widgets
   // do not). They never influence count or the numeric range.
+  // Locate the element holding the page's post LISTING, as opposed to the whole
+  // document. This matters because engines render post permalinks outside the
+  // listing: sidebar blocks for a random post, a featured post, or recent
+  // comments all link to arbitrary posts whose IDs bear no relation to the
+  // current page. Reading metrics from those poisons the search. A single
+  // sidebar link to an old post drags minNum down so far that every page's ID
+  // range appears to contain the target, which makes the search conclude
+  // "in range but absent" (a deletion verdict) on the very first probe.
+  //
+  // Detection is engine-agnostic: the listing is the element with the most
+  // post-bearing DIRECT CHILDREN. A grid has dozens (one per thumbnail), a
+  // sidebar block has one, and a shared ancestor such as <body> has only a
+  // couple, so the grid always wins without needing a per-engine selector.
+  function findPostListRoot(root) {
+    // Fast path: engines that label their listing container.
+    for (const sel of [".shm-image-list", "#post-list", ".post-list", "#posts",
+                       "#image-list", ".image-list", "#content .thumb-container"]) {
+      const el = root.querySelector?.(sel);
+      if (el) {
+        let n = 0;
+        for (const a of el.querySelectorAll("a[href]")) if (postIdFromAnchorHref(a)) n++;
+        if (n >= 3) return el;
+      }
+    }
+
+    const anchors = [];
+    for (const a of root.querySelectorAll("a[href]")) {
+      if (postIdFromAnchorHref(a)) anchors.push(a);
+    }
+    if (anchors.length < 3) return root; // too little to reason about
+
+    // For each ancestor, record which of its direct children lead to a post.
+    const childrenWithPosts = new Map();
+    for (const a of anchors) {
+      let child = a, parent = a.parentElement;
+      for (let d = 0; parent && d < 12; d++) {
+        let set = childrenWithPosts.get(parent);
+        if (!set) { set = new Set(); childrenWithPosts.set(parent, set); }
+        set.add(child);
+        child = parent;
+        parent = parent.parentElement;
+      }
+    }
+
+    let best = null, bestScore = 0;
+    for (const [el, set] of childrenWithPosts) {
+      if (set.size > bestScore) { bestScore = set.size; best = el; }
+    }
+    // Require a real cluster before trusting the result; otherwise fall back to
+    // the whole document so unusual layouts behave exactly as before.
+    return (best && bestScore >= 3) ? best : root;
+  }
+
   function extractPageInfo(root) {
+    // Restrict to the listing. Both the numeric metrics AND membership use this
+    // scope: a post that appears only in a sidebar is not "on this page" for
+    // navigation purposes, and treating it as such would send the user to a
+    // page where the thumbnail is not in the grid.
+    const listRoot = findPostListRoot(root);
     const seen = new Set();
     const ids = [];
     const nums = [];
 
     // Primary pass: post-permalink anchors. Metrics come only from here.
-    for (const a of root.querySelectorAll("a[href]")) {
+    for (const a of listRoot.querySelectorAll("a[href]")) {
       const key = postIdFromAnchorHref(a);
       if (!key || seen.has(key)) continue;
       seen.add(key);
@@ -1147,7 +1321,7 @@
     // a thumbnail exposes its ID without a matching permalink. Requiring an
     // image inside the wrapper keeps sitewide widgets (news banners, notices)
     // out even here.
-    for (const el of root.querySelectorAll(
+    for (const el of listRoot.querySelectorAll(
       "article, [data-post-id], [data-id], span.thumb, li.thumb, li.shm-thumb"
     )) {
       if (!isSinglePostWrapper(el)) continue;      // skip page-level containers
@@ -1156,7 +1330,7 @@
       if (key && !seen.has(key)) { seen.add(key); ids.push(key); }
     }
     // Bare-image thumbnails (engines with no wrapper element).
-    for (const img of root.querySelectorAll("img")) {
+    for (const img of listRoot.querySelectorAll("img")) {
       if (img.closest("article, [data-post-id], [data-id], span.thumb, li.thumb")) continue;
       const key = getPostId(img);
       if (key && !seen.has(key)) { seen.add(key); ids.push(key); }
@@ -1384,6 +1558,122 @@
   // navigated, false if the post wasn't found in the swept range. Used as a
   // safety net after binary search (whose ID-monotonic assumption can be
   // violated by custom sort orders, lazy-loaded fetched markup, or ID gaps).
+  // Remove a bookmark whose post the SITE HAS CONFIRMED no longer exists.
+  // This runs only on a definitive answer (a 404 on the post's own page, or an
+  // explicit deleted flag), never on a search that merely failed to find it:
+  // an inconclusive search is exactly the case that has produced false
+  // "deleted" verdicts before, and discarding a user's bookmark on a guess is
+  // not a trade worth making. Leaving a confirmed-dead entry in place is also
+  // wrong, since it counts toward the navigate total and can never be reached.
+  async function dropBookmark(postId) {
+    try {
+      const stored = await loadBookmarks();
+      if (!(postId in stored)) return false;
+      delete stored[postId];
+      await saveBookmarks(stored);
+      document.querySelectorAll("." + BOOKMARK_CLASS).forEach(el => {
+        if (getPostId(el) === postId) removeBookmark(el);
+      });
+      refreshJumpToast();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // When a bookmarked post is confirmed gone, a bare "not found" leaves the
+  // user holding a bookmark that can never be reached again. Instead, move them
+  // to the post that now sits closest to it in the index and re-point the
+  // bookmark there, so Navigate Bookmarks keeps working.
+  //
+  // The neighbours are already known: the search identified the page whose ID
+  // range brackets the target, and that page's surviving posts are exactly the
+  // deleted post's neighbours, so in the common case this costs no extra fetch.
+  //
+  // Returns true if the user was relocated, false to fall back to notFound.
+  async function relocateToNearestPost(oldPostId, targetNum, bookmarkPageUrl, hintPage, hintInfo, reason) {
+    if (targetNum === null) return false;
+
+    let page = hintPage;
+    let info = hintInfo;
+
+    // If the search never bracketed the target, locate the page once.
+    if (!info || !info.ok || info.count === 0 || info.minNum === null ||
+        !(targetNum <= info.maxNum && targetNum >= info.minNum)) {
+      const live = livePageInfo();
+      if (!live || live.count === 0 || live.maxNum === null) return false;
+      const span = Math.max(live.count, (live.maxNum - live.minNum) + 1);
+      const guess = Math.max(1, Math.floor((live.maxNum - targetNum) / span) + 1);
+      const probe = await fetchPageInfo(buildIndexPageUrl(bookmarkPageUrl, guess));
+      if (!probe.ok || probe.count === 0 || probe.minNum === null) return false;
+      page = guess;
+      info = probe;
+    }
+
+    // Nearest surviving post by ID distance. Ties resolve to the newer post,
+    // which is the one that sat immediately above the deleted one.
+    let best = null, bestDist = Infinity;
+    for (const key of info.ids) {
+      const m = /^num:(\d+)$/.exec(key);
+      if (!m) continue;
+      const n = parseInt(m[1], 10);
+      if (n === targetNum) continue;
+      const d = Math.abs(n - targetNum);
+      if (d < bestDist || (d === bestDist && n > best)) { bestDist = d; best = n; }
+    }
+    if (best === null) return false;
+
+    const newKey = "num:" + best;
+    const destUrl = buildIndexPageUrl(bookmarkPageUrl, page);
+
+    // Re-point the bookmark, preserving its position in the cycle order so the
+    // user's other bookmarks are not reshuffled underneath them.
+    try {
+      const stored = await loadBookmarks();
+      let next;
+      if (newKey in stored) {
+        next = { ...stored };
+        delete next[oldPostId];           // neighbour already bookmarked
+      } else {
+        next = {};
+        for (const [k, v] of Object.entries(stored)) {
+          if (k === oldPostId) next[newKey] = { page: destUrl, post: buildPostPermalink(best), addedAt: Date.now() };
+          else next[k] = v;
+        }
+        if (!(newKey in next)) next[newKey] = { page: destUrl, post: buildPostPermalink(best), addedAt: Date.now() };
+      }
+      await saveBookmarks(next);
+      // Record the index in cycle order, not raw key order, so the arriving
+      // page scrolls to the replacement rather than to some other bookmark.
+      const idx = orderedEntries(liveOnly(next)).findIndex(([k]) => k === newKey);
+      if (idx >= 0) sessionStorage.setItem("booru_bm_jumpindex", String(idx));
+    } catch (_) {
+      return false;
+    }
+
+    // Explain what happened once the destination page has loaded.
+    try {
+      sessionStorage.setItem("booru_bm_relocated", JSON.stringify({
+        from: targetNum, to: best, reason: reason || "missing"
+      }));
+    } catch (_) { /* non-fatal */ }
+
+    sessionStorage.setItem("booru_bm_autojump", "1");
+    sessionStorage.setItem("booru_bm_walked", "1");
+
+    // Same-URL destinations must hard-reload; see goToPage for rationale.
+    try {
+      const t = new URL(destUrl, location.origin);
+      const h = new URL(location.href);
+      if (t.origin === h.origin && t.pathname === h.pathname && t.search === h.search) {
+        location.reload();
+        return true;
+      }
+    } catch (_) { /* fall through */ }
+    navigateTo(destUrl);
+    return true;
+  }
+
   async function linearSweep(postId, bookmarkPageUrl, fromPage, toPage) {
     const lo = Math.max(1, Math.min(fromPage, toPage));
     const hi = Math.max(fromPage, toPage);
@@ -1412,8 +1702,10 @@
 
       if (!info.ok) {
         // Request failed rather than the listing ending. Tolerate a few, then
-        // give up rather than hammering a host that is refusing us.
-        if (++consecutiveFailures >= 3) return false;
+        // give up rather than hammering a host that is refusing us. Record that
+        // this was a block, not an absence, so the caller does not report a
+        // present bookmark as deleted.
+        if (++consecutiveFailures >= 3) { _searchBlocked = true; return false; }
         continue;
       }
       consecutiveFailures = 0;
@@ -1472,6 +1764,7 @@
       return;
     }
 
+    _searchBlocked = false; // fresh search: no block recorded yet
     showToast(label || "Locating bookmark across pages...", "info");
 
     // Determine the page number to start searching from. Prefer the page the
@@ -1518,14 +1811,21 @@
       navigateTo(dest);
     };
 
-    const notFound = (reason) => {
+    const notFound = (reason, dropped) => {
       // When the site gave a definitive answer we can say so plainly instead of
       // guessing. "unlisted" means the post still exists at its own URL but has
       // been removed from index listings, which is worth distinguishing.
+      // Name the post in every outcome. Without the ID a report of "not found"
+      // cannot be checked: with it, the post's own page can be opened directly
+      // to see whether it still exists, which distinguishes a genuinely removed
+      // post from a fault in the search.
+      const idLabel = targetNum !== null ? " #" + targetNum : "";
+      const tail = dropped ? " Bookmark removed." : "";
       const message =
-        reason === "gone"     ? "Bookmarked post no longer exists" :
-        reason === "unlisted" ? "Bookmarked post was deleted and is no longer listed" :
-                                "Bookmark Not found! Deleted?";
+        _searchBlocked        ? `Could not finish searching for post${idLabel}, the site is limiting requests. Try again shortly.` :
+        reason === "gone"     ? `Bookmarked post${idLabel} no longer exists on this site.${tail}` :
+        reason === "unlisted" ? `Bookmarked post${idLabel} was deleted and is no longer listed.${tail}` :
+                                `Bookmarked post${idLabel} was not found in this listing`;
       sessionStorage.setItem("booru_bm_deleted_notice", "1");
       if (sameIndexPage(bookmarkPageUrl)) {
         sessionStorage.removeItem("booru_bm_deleted_notice");
@@ -1610,6 +1910,11 @@
         );
         let seed = Math.max(1, Math.floor((highest - targetNum) / pageIdSpan) + 1);
 
+        // Remember the page whose ID range brackets the target. If the post
+        // turns out to be deleted, that page holds its surviving neighbours,
+        // so relocation needs no extra fetch.
+        let inRangePage = null;
+        let inRangeInfo = null;
         let probe = (hi !== null && seed >= hi) ? Math.max(lo + 1, hi - 1) : Math.max(seed, lo + 1 || 1);
         if (probe < 1) probe = 1;
         let expandStep = Math.max(1, Math.floor(seed / 2));
@@ -1682,7 +1987,6 @@
 
         // Phase B: binary search the bracket [lo, hi].
         if (bounded && hi !== null) {
-          let inRangePage = null; // page whose ID range contains target
           while (lo + 1 < hi) {
             const mid  = Math.floor((lo + hi) / 2);
             const info = await fetchPageInfo(buildIndexPageUrl(bookmarkPageUrl, mid));
@@ -1692,15 +1996,16 @@
             if (info.minNum === null) break;
             if (targetNum > info.maxNum)      hi = mid;
             else if (targetNum < info.minNum) lo = mid;
-            else { inRangePage = mid; break; } // in range, exact id absent
+            else { inRangePage = mid; inRangeInfo = info; break; } // in range, exact id absent
           }
           // Check the two boundary pages directly.
           for (const p of [lo, hi]) {
             if (p < 1) continue;
             const info = await fetchPageInfo(buildIndexPageUrl(bookmarkPageUrl, p));
             if (info.ids.includes(postId)) { goToPage(p); return; }
-            if (info.minNum !== null && targetNum <= info.maxNum && targetNum >= info.minNum)
-              inRangePage = p;
+            if (info.minNum !== null && targetNum <= info.maxNum && targetNum >= info.minNum) {
+              inRangePage = p; inRangeInfo = info;
+            }
           }
           // If the target's ID falls within a page's range but the exact post
           // isn't there, it is PROBABLY deleted. Check the immediate
@@ -1720,12 +2025,21 @@
       // replaces dozens of index fetches with one small request. Anything
       // inconclusive falls through to the sweep exactly as before.
       const status = await checkPostStatus(postId);
-      if (status === "gone" || status === "unlisted") { notFound(status); return; }
+      if (status === "gone" || status === "unlisted") {
+        if (await relocateToNearestPost(postId, targetNum, bookmarkPageUrl, inRangePage, inRangeInfo, status)) return;
+        // Confirmed gone and nowhere to move it: retire the entry so it
+        // stops counting toward the navigate total.
+        const dropped = await dropBookmark(postId);
+        notFound(status, dropped);
+        return;
+      }
 
       // Nothing conclusive from interpolation or binary search. Verify with a
       // bounded exhaustive sweep before declaring deletion, so a post that
       // exists is never falsely reported gone regardless of markup or ordering.
       if (await linearSweep(postId, bookmarkPageUrl, 1, 300)) return;
+      if (!_searchBlocked &&
+          await relocateToNearestPost(postId, targetNum, bookmarkPageUrl, inRangePage, inRangeInfo, null)) return;
       notFound();
       return;
     }
@@ -1759,7 +2073,8 @@
       const info = await fetchPageInfo(buildIndexPageUrl(bookmarkPageUrl, pageNum));
 
       if (!info.ok) {
-        if (++consecutiveFailures >= 3) break;    // host refusing: stop trying
+        // host refusing: stop trying, and remember it was a block not an absence
+        if (++consecutiveFailures >= 3) { _searchBlocked = true; break; }
         continue;
       }
       consecutiveFailures = 0;
@@ -1845,6 +2160,22 @@
       sessionStorage.removeItem("booru_bm_deleted_notice");
       showErrorToast("Bookmark Not found! Deleted?");
     }
+    // A relocated bookmark is not an error, so it gets an ordinary toast. The
+    // user must be told plainly that their bookmark now points somewhere else,
+    // since it was moved on their behalf.
+    const moved = sessionStorage.getItem("booru_bm_relocated");
+    if (moved) {
+      sessionStorage.removeItem("booru_bm_relocated");
+      try {
+        const { from, to, reason } = JSON.parse(moved);
+        const why = reason === "gone"     ? "no longer exists"
+                  : reason === "unlisted" ? "was deleted"
+                  :                         "is no longer in this listing";
+        showToast(`Post #${from} ${why}. Bookmark moved to the nearest remaining post #${to}.`, "warn");
+      } catch (_) {
+        showToast("Bookmarked post is gone. Bookmark moved to the nearest remaining post.", "warn");
+      }
+    }
   }
 
   // Run the one-time key migration before anything reads bookmarks, so the
@@ -1909,13 +2240,20 @@
       if (area !== "sync") return;
       if (!changes[STORAGE_KEY]) return;
       try {
-        const next = changes[STORAGE_KEY].newValue;
-        // Overwrite the mirror to exactly match sync (including an empty object
-        // from a deliberate clear). Only skip when sync's key was removed
-        // entirely (newValue undefined), leaving the mirror as the backup.
-        if (next !== undefined) {
-          chrome.storage.local.set({ [STORAGE_KEY]: next }, () => {
-            void chrome.runtime.lastError;
+        const incoming = changes[STORAGE_KEY].newValue;
+        // MERGE rather than overwrite. A verbatim copy would discard entries
+        // this device holds that the sending device had not yet seen, which is
+        // the same clobbering the merge on save exists to prevent. Per-entry
+        // stamps resolve any genuine conflict, so a removal still wins over a
+        // stale copy of the entry it removed.
+        if (incoming !== undefined) {
+          chrome.storage.local.get(STORAGE_KEY, (d) => {
+            if (chrome.runtime.lastError) return;
+            const mine = (d && d[STORAGE_KEY]) || {};
+            const merged = mergeBookmarkSets(mine, incoming);
+            chrome.storage.local.set({ [STORAGE_KEY]: merged }, () => {
+              void chrome.runtime.lastError;
+            });
           });
         }
       } catch (_) { /* mirror update is best-effort */ }
@@ -2048,6 +2386,11 @@
         stored[id] = { page: getTruePageUrl(), post: postLink };
         return saveBookmarks(stored);
       }).then(() => {
+        // Restart the cycle so the very next Navigate Bookmarks click goes to
+        // the bookmark just made. With newest-first ordering that is index 0,
+        // which is where a fresh cycle begins.
+        _jumpIndex = -1;
+        try { sessionStorage.removeItem("booru_bm_jumpindex"); } catch (_) {}
         refreshJumpToast();
         showToast("Bookmarked!", "success");
         sendResponse({ ok: true });
